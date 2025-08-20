@@ -56,7 +56,7 @@ app.post('/webhooks/plain', async (c) => {
 
 async function handleCallCompleted(payload: OpenPhoneWebhookPayload, env: Bindings): Promise<void> {
   const callData = payload.data.object as CallData;
-  const phoneNumber = callData.participants[0];
+  const phoneNumber = callData.direction === 'incoming' ? callData.from : callData.to;
   
   // Look up customer info from HubSpot first  
   const hubspotContact = await lookupHubSpotContact(phoneNumber, env);
@@ -581,6 +581,8 @@ interface CallData {
   direction: 'incoming' | 'outgoing';
   status: string;
   duration: number;
+  from: string;
+  to: string;
   participants: string[];
   createdAt: string;
   completedAt?: string;
