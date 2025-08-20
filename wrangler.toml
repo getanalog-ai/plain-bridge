@@ -1,0 +1,14 @@
+name = "plain-bridge"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[env.production]
+name = "plain-bridge"
+
+[env.staging]
+name = "plain-bridge-staging"
+
+# Environment variables (set these in Cloudflare dashboard or via wrangler secret)
+# PLAIN_API_KEY
+# OPENPHONE_API_KEY
+# WEBHOOK_SECRET (optional)
