@@ -9,6 +9,9 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
+// Simple in-memory cache to prevent duplicate call processing
+const processedCallIds = new Set<string>();
+
 app.post('/webhooks/openphone', async (c) => {
   try {
     const payload = await c.req.json() as OpenPhoneWebhookPayload;
@@ -58,15 +61,44 @@ async function handleCallCompleted(payload: OpenPhoneWebhookPayload, env: Bindin
   const callData = payload.data.object as CallData;
   const phoneNumber = callData.direction === 'incoming' ? callData.from : callData.to;
   
+  console.log(`Processing call ${callData.id} - ${callData.direction} - ${phoneNumber}`);
+  
+  // Check if we've already processed this call ID
+  if (processedCallIds.has(callData.id)) {
+    console.log(`Skipping duplicate call processing for call ID: ${callData.id}`);
+    return;
+  }
+  
+  // Mark this call as processed
+  processedCallIds.add(callData.id);
+  
+  // Clean up old call IDs (keep only last 1000 to prevent memory issues)
+  if (processedCallIds.size > 1000) {
+    const oldIds = Array.from(processedCallIds).slice(0, 500);
+    oldIds.forEach(id => processedCallIds.delete(id));
+  }
+  
   // Look up customer info from HubSpot first  
   const hubspotContact = await lookupHubSpotContact(phoneNumber, env);
   
   // Create or get customer in Plain
   const customer = await upsertCustomerInPlain(phoneNumber, hubspotContact, env);
+  console.log('Customer created/updated:', customer.id);
   
-  // Create thread for the call
-  const threadTitle = `Call ${callData.direction === 'incoming' ? 'from' : 'to'} ${phoneNumber}`;
-  const thread = await createThreadInPlain(customer.id, threadTitle, env);
+  // Try to find existing recent thread first (same logic as SMS)
+  let thread = await findRecentThreadForCustomer(customer.id, env);
+  
+  if (!thread) {
+    // No recent thread found, create new one
+    const threadTitle = `SMS conversation with ${phoneNumber}`;
+    thread = await createThreadInPlain(customer.id, threadTitle, env);
+    console.log('New thread created for call:', thread.id);
+    
+    // Add a mock SMS message so Plain knows this is a text conversation
+    await sendCustomerChatToPlain(customer.id, thread.id, `📞 Call ${callData.direction === 'incoming' ? 'received from' : 'made to'} this number`, env);
+  } else {
+    console.log('Using existing thread for call:', thread.id);
+  }
   
   // Add call details as thread event
   const callSummary = `
