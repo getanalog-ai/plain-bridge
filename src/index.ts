@@ -117,7 +117,7 @@ async function handleMessageReceived(payload: OpenPhoneWebhookPayload, env: Bind
   }
   
   // Send the message as a chat in Plain with attachments if present
-  await sendChatToPlain(customer.id, thread.id, messageData.body, messageData.media || [], env, phoneNumber);
+  await sendCustomerChatToPlain(customer.id, thread.id, messageData.body, env, messageData.media || []);
   console.log('Chat message sent to Plain');
 }
 
@@ -338,7 +338,7 @@ async function upsertCustomerInPlain(phoneNumber: string, hubspotContact: any, e
   
   const email = hubspotContact?.email 
     ? { email: hubspotContact.email, isVerified: false }
-    : { email: `${phoneNumber.replace('+', '')}@phone.maple.inc`, isVerified: false };
+    : null;
 
   const variables = {
     input: {
@@ -348,7 +348,7 @@ async function upsertCustomerInPlain(phoneNumber: string, hubspotContact: any, e
       onCreate: {
         externalId: phoneNumber,
         fullName,
-        email
+        ...(email && { email })
       },
       onUpdate: {}
     }
@@ -383,6 +383,7 @@ async function createThreadInPlain(customerId: string, title: string, env: Bindi
         thread {
           id
           title
+          channel
         }
       }
     }
@@ -393,8 +394,7 @@ async function createThreadInPlain(customerId: string, title: string, env: Bindi
       customerIdentifier: {
         customerId
       },
-      title,
-      channel: "API"
+      title
     }
   };
   
@@ -417,7 +417,14 @@ async function createThreadInPlain(customerId: string, title: string, env: Bindi
     throw new Error(`Plain API error: ${result.errors[0].message}`);
   }
   
-  return result.data.createThread.thread;
+  const thread = result.data.createThread.thread;
+  if (!thread) {
+    console.error('Thread creation failed - no thread returned:', result);
+    throw new Error('Thread creation failed');
+  }
+  console.log('Thread created with channel:', thread.channel);
+  
+  return thread;
 }
 
 async function createThreadEvent(threadId: string, title: string, description: string, env: Bindings) {
@@ -508,7 +515,7 @@ async function sendChatToPlain(customerId: string, threadId: string, message: st
   }
 }
 
-async function sendCustomerChatToPlain(customerId: string, threadId: string, message: string, env: Bindings) {
+async function sendCustomerChatToPlain(customerId: string, threadId: string, message: string, env: Bindings, media: Array<{url: string, type: string}> = []) {
   const mutation = `
     mutation SendCustomerChat($input: SendCustomerChatInput!) {
       sendCustomerChat(input: $input) {
@@ -519,11 +526,18 @@ async function sendCustomerChatToPlain(customerId: string, threadId: string, mes
     }
   `;
   
+  // Include media URLs in the text message since Plain doesn't support attachments in SendCustomerChatInput
+  let fullMessage = message;
+  if (media.length > 0) {
+    const mediaUrls = media.map(item => `${item.type}: ${item.url}`).join('\n');
+    fullMessage = message ? `${message}\n\n${mediaUrls}` : mediaUrls;
+  }
+
   const variables = {
     input: {
       customerId,
       threadId,
-      text: message
+      text: fullMessage
     }
   };
   
