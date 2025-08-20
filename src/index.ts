@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 type Bindings = {
   PLAIN_API_KEY: string;
   OPENPHONE_API_KEY: string;
+  HUBSPOT_ACCESS_TOKEN: string;
   WEBHOOK_SECRET?: string;
 };
 
@@ -57,8 +58,11 @@ async function handleCallCompleted(payload: OpenPhoneWebhookPayload, env: Bindin
   const callData = payload.data.object as CallData;
   const phoneNumber = callData.participants[0];
   
+  // Look up customer info from HubSpot first  
+  const hubspotContact = await lookupHubSpotContact(phoneNumber, env);
+  
   // Create or get customer in Plain
-  const customer = await upsertCustomerInPlain(phoneNumber, env);
+  const customer = await upsertCustomerInPlain(phoneNumber, hubspotContact, env);
   
   // Create thread for the call
   const threadTitle = `Call ${callData.direction === 'incoming' ? 'from' : 'to'} ${phoneNumber}`;
@@ -93,8 +97,11 @@ async function handleMessageReceived(payload: OpenPhoneWebhookPayload, env: Bind
   
   console.log(`Processing message from ${phoneNumber}: "${messageData.body}"`);
   
-  // Create or get customer
-  const customer = await upsertCustomerInPlain(phoneNumber, env);
+  // Look up customer info from HubSpot first
+  const hubspotContact = await lookupHubSpotContact(phoneNumber, env);
+  
+  // Create or get customer with HubSpot data
+  const customer = await upsertCustomerInPlain(phoneNumber, hubspotContact, env);
   console.log('Customer created/updated:', customer.id);
   
   // Try to find existing recent thread first
@@ -110,7 +117,7 @@ async function handleMessageReceived(payload: OpenPhoneWebhookPayload, env: Bind
   }
   
   // Send the message as a chat in Plain with attachments if present
-  await sendChatToPlain(customer.id, thread.id, messageData.body, messageData.media || [], env);
+  await sendChatToPlain(customer.id, thread.id, messageData.body, messageData.media || [], env, phoneNumber);
   console.log('Chat message sent to Plain');
 }
 
@@ -206,7 +213,107 @@ async function handlePlainChatMessage(payload: PlainWebhookPayload, env: Binding
   await sendSMSViaOpenPhone(phoneNumber, message, env);
 }
 
-async function upsertCustomerInPlain(phoneNumber: string, env: Bindings) {
+
+async function lookupHubSpotContact(phoneNumber: string, env: Bindings) {
+  try {
+    // Search both contacts and companies in parallel
+    const [contactsResponse, companiesResponse] = await Promise.allSettled([
+      // Contact search
+      fetch('https://api.hubapi.com/crm/v3/objects/contacts/search', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.HUBSPOT_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          filterGroups: [{
+            filters: [{
+              propertyName: 'phone',
+              operator: 'EQ',
+              value: phoneNumber
+            }]
+          }],
+          properties: [
+            'firstname', 'lastname', 'email', 'phone',
+            'jobtitle', 'company', 'hs_object_id'
+          ],
+          limit: 10
+        })
+      }),
+      // Company search  
+      fetch('https://api.hubapi.com/crm/v3/objects/companies/search', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${env.HUBSPOT_ACCESS_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          filterGroups: [{
+            filters: [{
+              propertyName: 'phone',
+              operator: 'EQ',
+              value: phoneNumber
+            }]
+          }],
+          properties: [
+            'name', 'domain', 'phone', 'city',
+            'state', 'country', 'industry', 'hs_object_id'
+          ],
+          limit: 10
+        })
+      })
+    ]);
+
+    let contacts = [];
+    let companies = [];
+
+    // Process contact search results
+    if (contactsResponse.status === 'fulfilled' && contactsResponse.value.ok) {
+      const contactData = await contactsResponse.value.json();
+      contacts = contactData.results || [];
+    }
+
+    // Process company search results
+    if (companiesResponse.status === 'fulfilled' && companiesResponse.value.ok) {
+      const companyData = await companiesResponse.value.json();
+      companies = companyData.results || [];
+    }
+
+    // Prefer contact data over company data
+    if (contacts.length > 0) {
+      const contact = contacts[0].properties;
+      console.log(`Found HubSpot contact for ${phoneNumber}:`, contact);
+      
+      return {
+        firstName: contact.firstname || '',
+        lastName: contact.lastname || '',
+        email: contact.email || null,
+        phone: contact.phone
+      };
+    }
+    
+    // Fallback to company data if no contact found
+    if (companies.length > 0) {
+      const company = companies[0].properties;
+      console.log(`Found HubSpot company for ${phoneNumber}:`, company);
+      
+      return {
+        firstName: company.name || phoneNumber,
+        lastName: '',
+        email: company.domain ? `info@${company.domain}` : null,
+        phone: company.phone
+      };
+    }
+
+    console.log(`No HubSpot data found for ${phoneNumber}`);
+    return null;
+  } catch (error) {
+    console.error('HubSpot lookup error:', error);
+    return null;
+  }
+}
+
+async function upsertCustomerInPlain(phoneNumber: string, hubspotContact: any, env: Bindings) {
   const mutation = `
     mutation UpsertCustomer($input: UpsertCustomerInput!) {
       upsertCustomer(input: $input) {
@@ -224,6 +331,15 @@ async function upsertCustomerInPlain(phoneNumber: string, env: Bindings) {
     }
   `;
   
+  // Use HubSpot data if available, otherwise fallback to phone number
+  const fullName = hubspotContact 
+    ? `${hubspotContact.firstName} ${hubspotContact.lastName}`.trim() || phoneNumber
+    : phoneNumber;
+  
+  const email = hubspotContact?.email 
+    ? { email: hubspotContact.email, isVerified: false }
+    : { email: `${phoneNumber.replace('+', '')}@phone.maple.inc`, isVerified: false };
+
   const variables = {
     input: {
       identifier: {
@@ -231,11 +347,8 @@ async function upsertCustomerInPlain(phoneNumber: string, env: Bindings) {
       },
       onCreate: {
         externalId: phoneNumber,
-        fullName: phoneNumber,
-        email: {
-          email: `${phoneNumber.replace('+', '')}@phone.maple.inc`,
-          isVerified: false
-        }
+        fullName,
+        email
       },
       onUpdate: {}
     }
@@ -281,6 +394,7 @@ async function createThreadInPlain(customerId: string, title: string, env: Bindi
         customerId
       },
       title,
+      channel: "API"
     }
   };
   
@@ -344,13 +458,11 @@ async function createThreadEvent(threadId: string, title: string, description: s
   });
 }
 
-async function sendChatToPlain(customerId: string, threadId: string, message: string, media: Array<{url: string, type: string}>, env: Bindings) {
+async function sendChatToPlain(customerId: string, threadId: string, message: string, media: Array<{url: string, type: string}>, env: Bindings, phoneNumber: string) {
   const mutation = `
-    mutation SendChat($input: SendChatInput!) {
-      sendChat(input: $input) {
-        chat {
-          id
-        }
+    mutation ReplyToThread($input: ReplyToThreadInput!) {
+      replyToThread(input: $input) {
+        __typename
       }
     }
   `;
@@ -364,9 +476,15 @@ async function sendChatToPlain(customerId: string, threadId: string, message: st
 
   const variables = {
     input: {
-      customerId,
       threadId,
-      text: fullMessage
+      textContent: fullMessage,
+      impersonation: {
+        asCustomer: {
+          customerIdentifier: {
+            externalId: phoneNumber
+          }
+        }
+      }
     }
   };
   
