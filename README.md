@@ -2,6 +2,14 @@
 
 A Cloudflare Worker that enables seamless integration between Plain (customer support platform) and OpenPhone (business phone system), allowing support teams to handle SMS conversations and call management directly within Plain.
 
+## TODOs
+
+- Add a `Call Customer` button to Plain threads.
+- Verify transcription handling from OpenPhone Calls within Plain
+- MMS support (Currently not supported via the OpenPhone API, but supported in the OpenPhone UI, uploads images to openphone s3 bucket, before sending, etc.) maybe reverse engineer or switch to twilio
+- vCard texting for new customers to save contact info of maple. Needs MMS support.
+- Google Verified SMS
+
 ## 🎯 Overview
 
 This bridge automatically synchronizes communications between Plain and OpenPhone, enabling:
